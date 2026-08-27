@@ -89,6 +89,15 @@ class QueueService:
         """Check if a worker is running for a group_id."""
         return self._queue_workers.get(group_id, False)
 
+    def get_known_group_ids(self) -> list[str]:
+        """List every group_id a queue has been created for.
+
+        A queue is created lazily on first use and never removed after
+        draining, so a group appears here for the life of the process even
+        once its backlog returns to zero.
+        """
+        return list(self._episode_queues.keys())
+
     async def initialize(self, graphiti_client: Any) -> None:
         """Initialize the queue service with a graphiti client.
 

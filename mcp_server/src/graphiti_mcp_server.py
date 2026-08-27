@@ -22,7 +22,7 @@ from graphiti_core.utils.bulk_utils import RawEpisode
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
 from config.schema import GraphitiConfig, ServerConfig
 from models.response_types import (
@@ -50,6 +50,7 @@ from services.factories import (
     EmbedderFactory,
     LLMClientFactory,
 )
+from services import metrics_service
 from services.queue_service import QueueService
 from utils.formatting import format_fact_result, to_edge_result, to_node_result
 from utils.type_config import (
@@ -1244,6 +1245,16 @@ async def health_check(request) -> JSONResponse:
     return JSONResponse({'status': 'healthy', 'service': 'graphiti-mcp'})
 
 
+@mcp.custom_route('/metrics', methods=['GET'])
+async def metrics_endpoint(request) -> Response:
+    """Prometheus metrics (ALE-51). Queue depth is refreshed inline (cheap,
+    in-process); graph-shape metrics are refreshed by a background task
+    and served from their last-computed value, see services/metrics_service.py."""
+    metrics_service.refresh_queue_metrics(queue_service)
+    body, content_type = metrics_service.render_metrics()
+    return Response(body, media_type=content_type)
+
+
 async def initialize_server() -> ServerConfig:
     """Parse CLI arguments and initialize the Graphiti server configuration."""
     global config, graphiti_service, queue_service, graphiti_client, semaphore
@@ -1379,6 +1390,11 @@ async def initialize_server() -> ServerConfig:
 
     # Initialize queue service with the client
     await queue_service.initialize(graphiti_client)
+
+    # Background refresh for the Cypher-derived metrics (ALE-51). Fire and
+    # forget: run_mcp_server() blocks on the transport next, so this is the
+    # last point where creating the task is safe without awaiting it.
+    asyncio.create_task(metrics_service.metrics_refresh_loop(graphiti_client.driver))
 
     # Set MCP server settings
     if config.server.host:
