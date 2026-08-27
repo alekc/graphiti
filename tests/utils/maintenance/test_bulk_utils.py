@@ -563,3 +563,87 @@ async def test_extract_nodes_and_edges_bulk_custom_instructions_multiple_episode
 
     for call in extract_edges_calls:
         assert call['custom_extraction_instructions'] == custom_instructions
+
+
+@pytest.mark.asyncio
+async def test_extract_nodes_and_edges_bulk_use_combined_extraction_false_by_default(
+    monkeypatch,
+):
+    """Default (no flag) must keep hitting the separate extract_nodes/extract_edges path,
+    never the combined one, so existing callers see no behaviour change."""
+    clients = _make_clients()
+    episode = _make_episode('1')
+
+    separate_calls = []
+    combined_calls = []
+
+    async def mock_extract_nodes(clients, episode, previous_episodes, **kwargs):
+        separate_calls.append('nodes')
+        return [], {}
+
+    async def mock_extract_edges(
+        clients, episode, nodes, previous_episodes, edge_type_map, **kwargs
+    ):
+        separate_calls.append('edges')
+        return []
+
+    async def mock_extract_combined(clients, episode, previous_episodes, **kwargs):
+        combined_calls.append(episode)
+        return [], [], {}
+
+    monkeypatch.setattr(bulk_utils, 'extract_nodes', mock_extract_nodes)
+    monkeypatch.setattr(bulk_utils, 'extract_edges', mock_extract_edges)
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.combined_extraction.extract_nodes_and_edges',
+        mock_extract_combined,
+    )
+
+    await extract_nodes_and_edges_bulk(clients, [(episode, [])], edge_type_map={})
+
+    assert separate_calls == ['nodes', 'edges']
+    assert combined_calls == []
+
+
+@pytest.mark.asyncio
+async def test_extract_nodes_and_edges_bulk_use_combined_extraction_true_dispatches_combined(
+    monkeypatch,
+):
+    """use_combined_extraction=True must route through the combined single-call path
+    instead of the separate extract_nodes / extract_edges calls."""
+    clients = _make_clients()
+    episode1 = _make_episode('1')
+    episode2 = _make_episode('2')
+
+    separate_calls = []
+    combined_calls = []
+
+    async def mock_extract_nodes(clients, episode, previous_episodes, **kwargs):
+        separate_calls.append('nodes')
+        return [], {}
+
+    async def mock_extract_edges(
+        clients, episode, nodes, previous_episodes, edge_type_map, **kwargs
+    ):
+        separate_calls.append('edges')
+        return []
+
+    async def mock_extract_combined(clients, episode, previous_episodes, **kwargs):
+        combined_calls.append(episode.uuid)
+        return [], [], {}
+
+    monkeypatch.setattr(bulk_utils, 'extract_nodes', mock_extract_nodes)
+    monkeypatch.setattr(bulk_utils, 'extract_edges', mock_extract_edges)
+    monkeypatch.setattr(
+        'graphiti_core.utils.maintenance.combined_extraction.extract_nodes_and_edges',
+        mock_extract_combined,
+    )
+
+    await extract_nodes_and_edges_bulk(
+        clients,
+        [(episode1, []), (episode2, [])],
+        edge_type_map={},
+        use_combined_extraction=True,
+    )
+
+    assert separate_calls == []
+    assert sorted(combined_calls) == sorted([episode1.uuid, episode2.uuid])
