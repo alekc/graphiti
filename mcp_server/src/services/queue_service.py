@@ -2,9 +2,12 @@
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
+
+from services import metrics_service
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +163,8 @@ class QueueService:
 
         async def process_episode():
             """Process the episode using the graphiti client."""
+            start = time.monotonic()
+            status = 'failure'
             try:
                 logger.info(f'Processing episode {uuid} for group {group_id}')
 
@@ -183,11 +188,16 @@ class QueueService:
                     uuid=uuid,
                 )
 
+                status = 'success'
                 logger.info(f'Successfully processed episode {uuid} for group {group_id}')
 
             except Exception as e:
                 logger.error(f'Failed to process episode {uuid} for group {group_id}: {str(e)}')
                 raise
+            finally:
+                metrics_service.record_episode_processing_duration(
+                    group_id, 'single', status, time.monotonic() - start
+                )
 
         # Use the existing add_episode_task method to queue the processing
         return await self.add_episode_task(group_id, process_episode)
@@ -234,6 +244,8 @@ class QueueService:
 
         async def process_bulk():
             """Process the batch using the graphiti client."""
+            start = time.monotonic()
+            status = 'failure'
             try:
                 logger.info(
                     f'Processing bulk batch of {len(bulk_episodes)} episodes for group {group_id}'
@@ -251,6 +263,7 @@ class QueueService:
                     use_combined_extraction=use_combined_extraction,
                 )
 
+                status = 'success'
                 logger.info(
                     f'Successfully processed bulk batch of {len(bulk_episodes)} episodes '
                     f'for group {group_id}'
@@ -259,5 +272,9 @@ class QueueService:
             except Exception as e:
                 logger.error(f'Failed to process bulk batch for group {group_id}: {str(e)}')
                 raise
+            finally:
+                metrics_service.record_episode_processing_duration(
+                    group_id, 'bulk', status, time.monotonic() - start
+                )
 
         return await self.add_episode_task(group_id, process_bulk)

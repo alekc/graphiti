@@ -1,9 +1,12 @@
 """Prometheus metrics for the graphiti MCP server (ALE-51).
 
-Two kinds of series, refreshed on different schedules:
+Three kinds of series, refreshed on different schedules:
 
 - Queue depth: live in-process state (`asyncio.Queue.qsize()`), read
   synchronously on every `/metrics` scrape. Cheap, no I/O.
+- Episode processing duration: recorded by queue_service.py as each
+  episode/batch actually finishes (or fails) processing. Event-driven,
+  not polled.
 - Graph-shape metrics: derived from Cypher queries against Neo4j
   (episode/entity/edge counts, ingest lag, empty-content episodes,
   orphaned edges, duplicate episode names). Recomputed on a background
@@ -17,7 +20,7 @@ import time
 from typing import Any
 
 from graphiti_core.driver.driver import GraphProvider
-from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Gauge, Histogram, generate_latest
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,15 @@ QUEUE_DEPTH = Gauge(
     'graphiti_queue_depth',
     'Episodes waiting in the per-group processing queue',
     ['group_id'],
+)
+EPISODE_PROCESSING_DURATION_SECONDS = Histogram(
+    'graphiti_episode_processing_duration_seconds',
+    'Wall-clock time to process one episode (single) or one batch (bulk), '
+    'from dequeue to completion or failure',
+    ['group_id', 'kind', 'status'],
+    # Observed range in practice: single episodes ~2.5-3.2 minutes (ALE-49),
+    # bulk batches longer. Buckets span seconds to ~20 minutes.
+    buckets=(1, 5, 15, 30, 60, 120, 180, 300, 600, 900, 1200),
 )
 EPISODES_TOTAL = Gauge(
     'graphiti_episodes_total',
@@ -112,6 +124,21 @@ def refresh_queue_metrics(queue_service: Any) -> None:
     """Set graphiti_queue_depth from live in-process queue state."""
     for group_id in queue_service.get_known_group_ids():
         QUEUE_DEPTH.labels(group_id=group_id).set(queue_service.get_queue_size(group_id))
+
+
+def record_episode_processing_duration(
+    group_id: str, kind: str, status: str, duration_seconds: float
+) -> None:
+    """Record one completed (or failed) episode/batch processing duration.
+
+    kind: 'single' (add_episode) or 'bulk' (add_episode_bulk).
+    status: 'success' or 'failure'. Recorded either way: a failed call still
+    consumed real wall-clock time, and a shift in failure-path duration is
+    itself a useful signal (e.g. retries piling up before the raise).
+    """
+    EPISODE_PROCESSING_DURATION_SECONDS.labels(
+        group_id=group_id, kind=kind, status=status
+    ).observe(duration_seconds)
 
 
 async def _run_group_query(driver: Any, query: str) -> list[dict[str, Any]]:

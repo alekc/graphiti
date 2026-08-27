@@ -170,3 +170,39 @@ def test_render_metrics_returns_prometheus_exposition_format():
     body, content_type = ms.render_metrics()
     assert content_type.startswith('text/plain')
     assert b'graphiti_queue_depth' in body or b'# HELP' in body
+
+
+def _histogram_count_and_sum(metric, **labels) -> tuple[float | None, float | None]:
+    count = sum_ = None
+    for m in metric.collect():
+        for s in m.samples:
+            if s.name.endswith('_count') and s.labels == labels:
+                count = s.value
+            elif s.name.endswith('_sum') and s.labels == labels:
+                sum_ = s.value
+    return count, sum_
+
+
+class TestRecordEpisodeProcessingDuration:
+    def test_success_recorded_under_its_own_labels(self):
+        ms.record_episode_processing_duration('ale51-unit-dur-a', 'single', 'success', 2.5)
+        count, total = _histogram_count_and_sum(
+            ms.EPISODE_PROCESSING_DURATION_SECONDS,
+            group_id='ale51-unit-dur-a', kind='single', status='success',
+        )
+        assert count == 1
+        assert total == 2.5
+
+    def test_failure_recorded_separately_from_success(self):
+        ms.record_episode_processing_duration('ale51-unit-dur-b', 'bulk', 'failure', 0.1)
+        ms.record_episode_processing_duration('ale51-unit-dur-b', 'bulk', 'success', 9.9)
+        fail_count, _ = _histogram_count_and_sum(
+            ms.EPISODE_PROCESSING_DURATION_SECONDS,
+            group_id='ale51-unit-dur-b', kind='bulk', status='failure',
+        )
+        success_count, _ = _histogram_count_and_sum(
+            ms.EPISODE_PROCESSING_DURATION_SECONDS,
+            group_id='ale51-unit-dur-b', kind='bulk', status='success',
+        )
+        assert fail_count == 1
+        assert success_count == 1
