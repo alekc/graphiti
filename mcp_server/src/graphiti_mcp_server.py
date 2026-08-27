@@ -18,6 +18,7 @@ from graphiti_core import Graphiti
 from graphiti_core.edges import EntityEdge
 from graphiti_core.nodes import EntityNode, EpisodeType, SagaNode
 from graphiti_core.search.search_filters import SearchFilters
+from graphiti_core.utils.bulk_utils import RawEpisode
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel
@@ -37,6 +38,12 @@ from models.response_types import (
     SuccessResponse,
     TripletResponse,
 )
+
+# Grafts use_combined_extraction onto Graphiti.add_episode_bulk before
+# anything below can call it. Applied at import time, not inside main(),
+# so it also covers any future entry point that imports this module
+# directly (tests included) rather than only the CLI path.
+from patches import graphiti_core_combined_extraction
 from services.factories import (
     CrossEncoderFactory,
     DatabaseDriverFactory,
@@ -53,6 +60,8 @@ from utils.type_config import (
     coerce_group_ids,
     parse_reference_time,
 )
+
+graphiti_core_combined_extraction.apply()
 
 # Load .env file from mcp_server directory
 mcp_server_dir = Path(__file__).parent.parent
@@ -150,6 +159,12 @@ Core tools:
   excluded_entity_types and custom_extraction_instructions to steer extraction,
   previous_episode_uuids to supply explicit context, update_communities to refresh community summaries,
   and saga / saga_previous_episode_uuid to associate the episode with an ordered saga.
+- add_memory_bulk: add several episodes in one call, queued as a single unit so they cannot
+  interleave with other episodes for the same group_id. Prefer this over repeated add_memory
+  calls whenever multiple episodes are ready at once. use_combined_extraction=True cuts node+edge
+  extraction to one LLM call per episode instead of two; every episode's extraction also runs
+  concurrently rather than one after another. No update_communities or previous_episode_uuids
+  support (bulk has neither); saga is one shared value for the whole batch, not per episode.
 - add_triplet: write a single fact (source entity -> fact -> target entity) directly, bypassing
   extraction. graphiti-core resolves/deduplicates the endpoint entities and generates embeddings.
 - search_nodes: semantic + keyword + graph search over entities, optionally filtered by entity type
@@ -485,6 +500,140 @@ async def add_memory(
         error_msg = str(e)
         logger.error(f'Error queuing episode: {error_msg}')
         return ErrorResponse(error=f'Error queuing episode: {error_msg}')
+
+
+class BulkEpisodeItem(BaseModel):
+    """One episode within an add_memory_bulk batch. Same per-episode fields as
+    add_memory, minus the batch-level ones (group_id, saga, ...) that apply to
+    every item in the call instead."""
+
+    name: str
+    episode_body: str
+    source: str = 'text'
+    source_description: str = ''
+    uuid: str | None = None
+    reference_time: str | None = None
+
+
+@mcp.tool()
+async def add_memory_bulk(
+    episodes: list[BulkEpisodeItem],
+    group_id: str | None = None,
+    excluded_entity_types: list[str] | None = None,
+    custom_extraction_instructions: str | None = None,
+    saga: str | None = None,
+    use_combined_extraction: bool = False,
+) -> SuccessResponse | ErrorResponse:
+    """Add a batch of episodes to memory in a single extraction pass.
+
+    Prefer this over calling add_memory once per episode when you already have
+    several episodes ready at once: with use_combined_extraction=True, node and
+    edge extraction for the whole batch runs as one LLM call per episode instead
+    of two, and every episode's extraction runs concurrently rather than strictly
+    one after another. This function returns immediately; the batch is queued as
+    a single unit in the same per-group_id sequential queue add_memory uses, so
+    it cannot interleave with, or race, any other episode already queued for
+    this group.
+
+    Every item shares one group_id, and, if provided, one saga: sagas link an
+    entire batch together in event-time order, they are not assignable per item.
+    A malformed reference_time on any item fails the whole call before anything
+    is queued, so partial batches never happen.
+
+    Args:
+        episodes: The batch of episodes to add. Each item takes the same shape
+            as add_memory's per-episode arguments: name, episode_body, source
+            ('text' | 'json' | 'message', default 'text'), source_description,
+            uuid, and reference_time (ISO-8601, e.g. "2025-01-15T10:30:00Z";
+            defaults to the current time when omitted, same as add_memory).
+        group_id (str, optional): A unique ID for this graph, shared by every
+            episode in the batch. If not provided, uses the default group_id
+            from CLI or a generated one.
+        excluded_entity_types (list[str], optional): Names of configured entity
+            types to exclude from extraction, applied to every episode in the batch.
+        custom_extraction_instructions (str, optional): Additional natural-language
+            guidance passed to the extraction model for every episode in the batch.
+        saga (str, optional): Name/id of a saga to associate every episode in the
+            batch with, in reference_time order. Sagas group related episodes so
+            their evolving narrative can be summarized via summarize_saga.
+        use_combined_extraction (bool, optional): When True, node and edge
+            extraction run as a single LLM call per episode instead of two
+            sequential calls. Defaults to False, matching add_memory's behaviour.
+
+    Example:
+        add_memory_bulk(
+            episodes=[
+                {"name": "Note 1", "episode_body": "...", "reference_time": "2026-08-25"},
+                {"name": "Note 2", "episode_body": "...", "reference_time": "2026-08-26"},
+            ],
+            use_combined_extraction=True,
+        )
+    """
+    global graphiti_service, queue_service
+
+    if graphiti_service is None or queue_service is None:
+        return ErrorResponse(error='Services not initialized')
+
+    if not episodes:
+        return ErrorResponse(error='episodes must be a non-empty list')
+
+    effective_group_id = group_id or config.graphiti.group_id
+
+    # Parse every reference_time and resolve every episode_type up front, same
+    # as add_memory, so a bad item fails the whole call before anything queues
+    # rather than surfacing mid-batch inside the background worker.
+    bulk_episodes: list[RawEpisode] = []
+    for item in episodes:
+        try:
+            parsed_reference_time = parse_reference_time(item.reference_time)
+        except ValueError as e:
+            return ErrorResponse(error=f"Invalid reference_time on episode '{item.name}': {e}")
+
+        episode_type = EpisodeType.text
+        if item.source:
+            try:
+                episode_type = EpisodeType[item.source.lower()]
+            except (KeyError, AttributeError):
+                logger.warning(
+                    f"Unknown source type '{item.source}' on episode "
+                    f"'{item.name}', using 'text' as default"
+                )
+                episode_type = EpisodeType.text
+
+        bulk_episodes.append(
+            RawEpisode(
+                name=item.name,
+                uuid=item.uuid,
+                content=item.episode_body,
+                source_description=item.source_description,
+                source=episode_type,
+                reference_time=parsed_reference_time or datetime.now(timezone.utc),
+            )
+        )
+
+    try:
+        await queue_service.add_episode_bulk(
+            group_id=effective_group_id,
+            bulk_episodes=bulk_episodes,
+            entity_types=graphiti_service.entity_types,
+            edge_types=graphiti_service.edge_types,
+            edge_type_map=graphiti_service.edge_type_map,
+            excluded_entity_types=excluded_entity_types,
+            custom_extraction_instructions=custom_extraction_instructions,
+            saga=saga,
+            use_combined_extraction=use_combined_extraction,
+        )
+
+        return SuccessResponse(
+            message=(
+                f'{len(bulk_episodes)} episodes queued for bulk processing in '
+                f"group '{effective_group_id}'"
+            )
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error queuing bulk episodes: {error_msg}')
+        return ErrorResponse(error=f'Error queuing bulk episodes: {error_msg}')
 
 
 @mcp.tool()

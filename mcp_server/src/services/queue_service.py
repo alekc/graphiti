@@ -182,3 +182,73 @@ class QueueService:
 
         # Use the existing add_episode_task method to queue the processing
         return await self.add_episode_task(group_id, process_episode)
+
+    async def add_episode_bulk(
+        self,
+        group_id: str,
+        bulk_episodes: list[Any],
+        entity_types: Any,
+        edge_types: Any = None,
+        edge_type_map: Any = None,
+        excluded_entity_types: list[str] | None = None,
+        custom_extraction_instructions: str | None = None,
+        saga: str | None = None,
+        use_combined_extraction: bool = False,
+    ) -> int:
+        """Add a batch of episodes for processing as one bulk operation.
+
+        Takes the same slot in the per-group_id sequential queue as a single
+        add_episode call, so a bulk batch cannot interleave with, or race,
+        any other episode already queued for this group.
+
+        Args:
+            group_id: The group ID all episodes in the batch belong to
+            bulk_episodes: RawEpisode instances (graphiti_core.utils.bulk_utils.RawEpisode),
+                each carrying its own uuid/name/reference_time
+            entity_types: Entity types for extraction
+            edge_types: Optional mapping of edge (fact) type name to Pydantic model
+            edge_type_map: Optional mapping of (source, target) entity type pairs to
+                allowed edge type names
+            excluded_entity_types: Optional list of entity type names to exclude
+                from extraction
+            custom_extraction_instructions: Optional extra natural-language
+                instructions for the extraction LLM
+            saga: Optional saga name to associate every episode in the batch with
+            use_combined_extraction: When True, node and edge extraction run as a
+                single LLM call per episode instead of two sequential calls
+
+        Returns:
+            The position in the queue
+        """
+        if self._graphiti_client is None:
+            raise RuntimeError('Queue service not initialized. Call initialize() first.')
+
+        async def process_bulk():
+            """Process the batch using the graphiti client."""
+            try:
+                logger.info(
+                    f'Processing bulk batch of {len(bulk_episodes)} episodes for group {group_id}'
+                )
+
+                await self._graphiti_client.add_episode_bulk(
+                    bulk_episodes=bulk_episodes,
+                    group_id=group_id,
+                    entity_types=entity_types,
+                    excluded_entity_types=excluded_entity_types,
+                    edge_types=edge_types,
+                    edge_type_map=edge_type_map,
+                    custom_extraction_instructions=custom_extraction_instructions,
+                    saga=saga,
+                    use_combined_extraction=use_combined_extraction,
+                )
+
+                logger.info(
+                    f'Successfully processed bulk batch of {len(bulk_episodes)} episodes '
+                    f'for group {group_id}'
+                )
+
+            except Exception as e:
+                logger.error(f'Failed to process bulk batch for group {group_id}: {str(e)}')
+                raise
+
+        return await self.add_episode_task(group_id, process_bulk)
