@@ -725,8 +725,13 @@ async def search_memory_facts(
     valid_at_before: str | None = None,
     invalid_at_after: str | None = None,
     invalid_at_before: str | None = None,
+    current_only: bool = False,
 ) -> FactSearchResponse | ErrorResponse:
     """Search the graph memory for relevant facts (entity edges).
+
+    By default this returns superseded facts alongside live ones, ranked purely by
+    relevance, so history comes back looking like present tense. Pass
+    ``current_only=True`` to get only facts that are still true.
 
     Args:
         query: The search query
@@ -740,6 +745,13 @@ async def search_memory_facts(
         valid_at_before: Optional ISO-8601 upper bound on a fact's valid_at
         invalid_at_after: Optional ISO-8601 lower bound on a fact's invalid_at
         invalid_at_before: Optional ISO-8601 upper bound on a fact's invalid_at
+        current_only: Return only facts that have not been superseded, meaning both
+            invalid_at and expired_at are unset. This is what "current" means in this
+            schema, and none of the four bounds above can express it: they constrain
+            the values of those fields, so bounding invalid_at selects exactly the
+            invalidated facts. Mutually exclusive with invalid_at_after and
+            invalid_at_before; combining them is an error. Composes with valid_at_after
+            and valid_at_before, which window when a fact became true.
     """
     global graphiti_service
 
@@ -759,9 +771,10 @@ async def search_memory_facts(
                 valid_at_before=valid_at_before,
                 invalid_at_after=invalid_at_after,
                 invalid_at_before=invalid_at_before,
+                current_only=current_only,
             )
         except ValueError as e:
-            return ErrorResponse(error=f'Invalid date filter: {e}')
+            return ErrorResponse(error=f'Invalid search filter: {e}')
 
         client = await graphiti_service.get_client()
 

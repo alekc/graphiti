@@ -160,12 +160,22 @@ def _date_range_or_group(
     return [conditions]
 
 
+def _is_null_group() -> list[list[DateFilter]]:
+    """Build a date filter that matches only rows where the field is NULL.
+
+    ``ComparisonOperator.is_null`` renders as a bare ``IS NULL`` predicate and
+    binds no query parameter, so ``DateFilter.date`` is deliberately left unset.
+    """
+    return [[DateFilter(comparison_operator=ComparisonOperator.is_null)]]
+
+
 def build_fact_search_filters(
     edge_types: list[str] | None = None,
     valid_at_after: str | None = None,
     valid_at_before: str | None = None,
     invalid_at_after: str | None = None,
     invalid_at_before: str | None = None,
+    current_only: bool = False,
 ) -> SearchFilters | None:
     """Build a ``SearchFilters`` for fact (edge) search.
 
@@ -175,7 +185,27 @@ def build_fact_search_filters(
     The ``*_after`` / ``*_before`` arguments are ISO-8601 strings parsed via
     :func:`parse_reference_time` (UTC-coerced). Raises ``ValueError`` on a bad
     timestamp.
+
+    ``current_only`` restricts results to facts that have not been superseded,
+    which in this schema means both ``invalid_at`` and ``expired_at`` are NULL.
+    None of the four date bounds can express that: they constrain the *values*
+    of those fields, and a live fact has no value to constrain, so bounding
+    ``invalid_at`` selects exactly the invalidated facts a caller asking for
+    current ones wants to exclude.
+
+    ``current_only`` is therefore mutually exclusive with the ``invalid_at_*``
+    bounds, and combining them raises ``ValueError`` rather than silently
+    resolving to one or the other or to an always-empty result. The
+    ``valid_at_*`` bounds stay compatible: they window *when a fact became
+    true*, which is orthogonal to whether it still is.
     """
+    if current_only and (invalid_at_after is not None or invalid_at_before is not None):
+        raise ValueError(
+            'current_only cannot be combined with invalid_at_after or '
+            'invalid_at_before: current_only matches facts whose invalid_at is '
+            'NULL, which no bound on invalid_at can match'
+        )
+
     valid_after = parse_reference_time(valid_at_after)
     valid_before = parse_reference_time(valid_at_before)
     invalid_after = parse_reference_time(invalid_at_after)
@@ -183,12 +213,18 @@ def build_fact_search_filters(
 
     valid_at = _date_range_or_group(valid_after, valid_before)
     invalid_at = _date_range_or_group(invalid_after, invalid_before)
+    expired_at = None
 
-    if not edge_types and valid_at is None and invalid_at is None:
+    if current_only:
+        invalid_at = _is_null_group()
+        expired_at = _is_null_group()
+
+    if not edge_types and valid_at is None and invalid_at is None and expired_at is None:
         return None
 
     return SearchFilters(
         edge_types=edge_types or None,
         valid_at=valid_at,
         invalid_at=invalid_at,
+        expired_at=expired_at,
     )

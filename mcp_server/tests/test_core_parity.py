@@ -151,6 +151,50 @@ class TestBuildFactSearchFilters:
         with pytest.raises(ValueError):
             build_fact_search_filters(valid_at_after='garbage')
 
+    def test_current_only_is_null_on_both_fields(self):
+        sf = build_fact_search_filters(current_only=True)
+        assert isinstance(sf, SearchFilters)
+        # "Current" is invalid_at IS NULL AND expired_at IS NULL. Both are
+        # required: expiry and invalidation are set independently.
+        for group in (sf.invalid_at, sf.expired_at):
+            assert group is not None
+            assert len(group) == 1
+            assert len(group[0]) == 1
+            assert group[0][0].comparison_operator == ComparisonOperator.is_null
+            # is_null binds no query parameter, so no date may be attached.
+            assert group[0][0].date is None
+
+    def test_current_only_alone_is_not_none(self):
+        # current_only is a criterion in its own right, so the no-criteria
+        # early return must not swallow it.
+        assert build_fact_search_filters(current_only=True) is not None
+
+    def test_current_only_composes_with_valid_at(self):
+        sf = build_fact_search_filters(
+            current_only=True,
+            valid_at_after='2025-01-01T00:00:00Z',
+        )
+        assert isinstance(sf, SearchFilters)
+        assert sf.valid_at is not None
+        assert sf.valid_at[0][0].comparison_operator == ComparisonOperator.greater_than_equal
+        assert sf.invalid_at is not None
+        assert sf.invalid_at[0][0].comparison_operator == ComparisonOperator.is_null
+
+    @pytest.mark.parametrize('bound', ['invalid_at_after', 'invalid_at_before'])
+    def test_current_only_rejects_invalid_at_bounds(self, bound):
+        # Contradictory rather than merely redundant: a bound on invalid_at can
+        # only match a fact that has one, which current_only excludes. Fail
+        # loudly instead of silently picking a winner or returning nothing.
+        with pytest.raises(ValueError, match='current_only'):
+            build_fact_search_filters(current_only=True, **{bound: '2025-01-01T00:00:00Z'})
+
+    def test_invalid_at_bounds_still_work_without_current_only(self):
+        sf = build_fact_search_filters(invalid_at_before='2025-01-01T00:00:00Z')
+        assert isinstance(sf, SearchFilters)
+        assert sf.invalid_at is not None
+        assert sf.invalid_at[0][0].comparison_operator == ComparisonOperator.less_than_equal
+        assert sf.expired_at is None
+
 
 class TestQueueServiceThreading:
     """The queue service must forward every parity param to Graphiti.add_episode."""
